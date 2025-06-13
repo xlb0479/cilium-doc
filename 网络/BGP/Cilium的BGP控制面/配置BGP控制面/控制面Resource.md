@@ -348,3 +348,104 @@ spec:
 ```
 
 如果你的上游路由器支持Equal Cost Multi Path(ECMP)，可以利用这个特性实现多个节点到Service的流量负载均衡，从多个节点上广播同一个虚拟IP。
+
+> 警告，很多路由器对于路由表中的ECMP数量有限制。如果从很多节点上广播Service的虚拟IP，可能就会超过这个限制。所以使用这个功能之前先好好了解一下。
+
+#### ExternalIP
+
+如果此时要跟`kubeProxyReplacement`同时用，那就要确定是否启用了ExternalIP。
+
+如果只需要广播Service的`.spec.externalIPs`，可以将`service.address`设置为`ExternalIP`。
+
+```yaml
+apiVersion: cilium.io/v2alpha1
+kind: CiliumBGPAdvertisement
+metadata:
+  name: bgp-advertisements
+  labels:
+    advertise: bgp
+spec:
+  advertisements:
+    - advertisementType: "Service"
+      service:
+        addresses:                  # <-- specify the service types to advertise
+          - ExternalIP
+      selector:                     # <-- select Services to advertise
+        matchExpressions:
+          - { key: bgp, operator: In, values: [ blue ] }
+```
+
+#### ClusterIP
+
+如果此时要跟`kubeProxyReplacement`同时用，需要设置一些特殊的BPF参数。详见[从外部访问Cluster IP](../../../Kubernetes网络/替换kube-proxy.md#从外部访问clusterip-service)。
+
+如果只需要广播Service的`.spec.clusterIP`和`.spec.clusterIPs`，可以将`virtualRouters[*].serviceAdvertisements`设置为`ClusterIP`。
+
+```yaml
+apiVersion: cilium.io/v2alpha1
+kind: CiliumBGPAdvertisement
+metadata:
+  name: bgp-advertisements
+  labels:
+    advertise: bgp
+spec:
+  advertisements:
+    - advertisementType: "Service"
+      service:
+        addresses:          # <-- specify the service types to advertise
+          - ClusterIP
+      selector:             # <-- select Services to advertise
+        matchExpressions:
+          - { key: bgp, operator: In, values: [ blue ] }
+```
+
+#### Load Balancer IP
+
+略
+
+## BGP配置覆盖
+
+`CiliumBGPNodeConfigOverride`可以用来按节点覆盖一些自动生成的配置。
+
+下面的例子中，为名为`bgpv2-cplane-dev-multi-homing-worker`的节点设置了Router ID以及为每个对端设置了本地地址。
+
+```yaml
+apiVersion: cilium.io/v2alpha1
+kind: CiliumBGPNodeConfigOverride
+metadata:
+  name: bgpv2-cplane-dev-multi-homing-worker
+spec:
+  bgpInstances:
+    - name: "instance-65000"
+      routerID: "192.168.10.1"
+      localPort: 1790
+      peers:
+        - name: "peer-65000-tor1"
+          localAddress: fd00:10:0:2::2
+        - name: "peer-65000-tor2"
+          localAddress: fd00:11:0:2::2
+```
+
+> 注意，`CiliumBGPNodeConfigOverride`的name必须要跟节点的名字匹配上。同样，BGP实例的名字以及对端的名字也必须要跟`CiliumBGPClusterConfig`中的配置匹配。
+>
+> 这个东西是按节点配的。
+
+### RouterID
+
+当Cilium运行在IPv4单栈或者双栈上，BGP控制面可以使用节点的IPv4地址作为BGP Router ID，因为Router ID是一个32位长整型数字。而且可以利用IPv4地址的唯一性来保证Router ID的唯一，IPv6这里就不好使。因此如果是运行在IPv6单栈上，或者又不想自动分配Router ID，那么就需要管理者手动设定。
+
+需要设置自定义Router ID的时候，就可以把`routerID`设置成一个IPv4地址的格式就好。
+
+### 监听端口
+
+BGP控制面实例化每个虚拟路由器的时候默认不会提供监听端口。这就会导致BGP路由器只能向指定的对端发起连接，而不能接受连接。这的确是默认行为，因为BGP控制面就是被设计用于同一节点上已经有另一个BGP路由器(比如Bird)的环境中的。如果需要接受连接，那就可以设置`localPort`。
+
+### 本地地址
+
+这个是BGP控制面用的源接口和地址，控制面与邻居建立对等连接的时候要根据`CiliumBGPClusterConfig`中配置的对端地址进行路由查询。你的节点上可能会有多个网卡，而你想要更明确的控制对等连接要建立在哪个网卡上。
+
+要配置这种源地址，设置`peers[*].localAddress`。设置成节点上的某个网卡的地址即可。
+
+## 配置示例
+
+[contrib/containerlab/bgpv2](https://github.com/cilium/cilium/tree/main/contrib/containerlab/bgpv2)。
