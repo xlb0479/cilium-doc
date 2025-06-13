@@ -47,3 +47,45 @@ level=warning msg="sent notification" Data="as number mismatch expected 65003, r
 ```
 
 在上面的例子中，可以看到，BGP会话无法建立时因为配置的`peerASN`和真实的对端ASN不一样导致的。
+
+BGP对等无法建立的原因有很多，比如BGP能力不匹配或者Peer IP填错了。BGP层面的错误一般都会出现在日志里，但也有一些底层错误可能不会出现在日志里，比如到Peer IP的连通性问题，或者某个eBGP的距离大于1跳，此时用`WireShark`或者`tcpdump`更有效果。
+
+## 添加了新的CiliumBGPPeeringPolicy之后当前BGP会话立刻断连
+
+由于`nodeSelector`的配置问题，同一个节点可能会被多个`CiliumBGPPeeringPolicy`选中。如果应用了多个策略，那么BGP控制面会删除该节点已有的所有状态。此时，首先将最后应用的`CiliumBGPPeeringPolicy`回滚，并检查BGP断连时的节点日志。如果出现了多个策略，会有这样的日志：
+
+```log
+level=error msg="Policy selection failed" component=Controller.Reconcile error="more then one CiliumBGPPeeringPolicy applies to this node, please ensure only a single Policy matches this node's labels" subsys=bgp-control-plane
+```
+
+此时就要检查`nodeSelector`配置，确保每个节点只关联一个`CiliumBGPPeeringPolicy`。
+
+## 新加的CiliumBGPClusterConfig不管用
+
+跟`CiliumBGPPeeringPolicy`类似，多个`CiliumBGPClusterConfig`根据`nodeSelector`的配置也可能选中相同的节点。如果出现这种情况，Cilium operator会拒绝额外的`CiliumBGPClusterConfig`再去添加`CiliumBGPNodeConfig`资源。`CiliumBGPClusterConfig`的状态会被设置成下面这样：
+
+```yaml
+status:
+  conditions:
+  - lastTransitionTime: "2024-10-26T06:18:04Z"
+    message: 'Selecting the same node(s) with ClusterConfig(s): [cilium-bgp-0]'
+    observedGeneration: 1
+    reason: ConflictingClusterConfigs
+    status: "True"
+    type: cilium.io/ConflictingClusterConfig
+```
+
+## CiliumBGPPeerConfig不起作用
+
+如果`CiliumBGPPeerConfig`不起作用，可能是因为`peerConfigRef`配错了，引用无效。如果找不到引用的`CiliumBGPPeerConfig`，就会出现下面的状态：
+
+```yaml
+status:
+  conditions:
+  - lastTransitionTime: "2024-10-26T06:15:44Z"
+    message: 'Referenced CiliumBGPPeerConfig(s) are missing: [peer-cofnig0]'
+    observedGeneration: 1
+    reason: MissingPeerConfigs
+    status: "True"
+    type: cilium.io/MissingPeerConfigs
+```
