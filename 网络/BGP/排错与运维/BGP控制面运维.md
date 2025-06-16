@@ -259,3 +259,50 @@ kubectl -n kube-system logs <cilium agent pod name> | grep "subsys=bgp-control-p
 
 ##### Service路由
 
+如果你广播了Service路由，负载均衡（KubeProxy或者是Cilium KubeProxyReplacement）可能就无法从外部访问了。而且上游路由器的ECMP重新散列，导致正在进行中的连接可能会被重定向到不同的节点。当负载均衡遇到了未知的流量，它就要选择一个新的endpoint。根据负载均衡的算法不同，流量可能会被转向到一个跟之前不同的endpoint上，继而导致连接被reset。
+
+如果上游的路由器支持[Resilient Hashing](https://www.juniper.net/documentation/us/en/software/junos/interfaces-ethernet-switches/topics/topic-map/resillient-hashing-lag-ecmp.html)的ECMP，启用了的话也许会让进行中的连接继续被转发到同一个节点上。启用Cilium的[Maglev Consistent Hashing](../../Kubernetes网络/替换kube-proxy.md#maglev一致性哈希)也会有同样的效果，因为它可以提升所有节点为相同流量选择相同endpoint的几率。但只对`externalTrafficPolicy: Cluster`有效。如果是`local`，那就无法避免异常节点上的连接被转发到另一个节点的情况了，这些连接都会被reset。
+
+### 节点挂了
+
+如果节点挂了，它上面的BGP会话也就都断了。对端回立即删除它广播的路由，如果开了优雅重启那就等待相应的时间。但如果你广播了`externalTrafficPolicy=cluster`的Service的路由，那么后者就有问题了，因为它会在重启等待时间（默认120秒）内继续将流量转发到这个有问题的节点。
+
+#### 解决办法
+
+##### 非主动停机
+
+如果节点是非主动停机，那就没有什么太好的办法。可以选择不用BGP的优雅重启，这就是在异常发现速度和Cilium Pod重启时的稳定性之间进行权衡了。
+
+关闭优雅重启可以让BGP对端更快的撤销路由。即便节点停机时没有BGP Notification，或者也没有TCP连接关闭，撤销路由的最长时间也就是BGP的hold time。如果开了优雅重启，BGP对端可能就要等hold time + restart time这段时间才会撤销路由。
+
+##### 主动停机
+
+参照[节点停机](#节点停机)做就好。
+
+### 对等连接断了
+
+如果对等连接断了，通常来说BGP会话和datapath的连通性也就断了。但在一段时间内可能会出现datapath连通性没有了，而BGP会话还在，并且路由依然被广播出来了。这就会让BGP对端将流量发送到异常的链路上，导致丢包。这个时间段的长度取决于链路以及BGP的配置。
+
+如果直连节点链路断开，BGP会话一般就会立即断开了，因为Linux内核会探测到链路异常，立即断开TCP会话。如果非直连节点链路断开，BGP会话会等待hold timer到时再断开，默认90秒。
+
+#### 解决办法
+
+如果要更快的检测到链路异常，可以缩短`holdTimeSeconds`和`keepAliveTimeSeconds`。最小值分别是`3`和`1`。通常用来加快异常检测的方法是BFD（Bidirectional Forwarding Detection），但Cilium目前还不支持。
+
+### Cilium Operator挂了
+
+这东西要负责将`CiliumBGPClusterConfig`翻译成每个节点的`CiliumBGPNodeConfig`。如果这玩意挂了，BGP控制面的生成就会有问题。
+
+同样，PodCIDR、LoadBalancer IP的分配也会出问题，前者依赖IPAM，后者依赖LB-IPAM。因此PodCIDR和Service虚拟IP的分配和撤销都会出问题。
+
+#### 解决办法
+
+从BGP层面来说没啥解决办法。可以对Operator做高可用部署，这样会好一点。
+
+### Service的后端全挂了
+
+如果由于掉电或者配置错误导致Service的所有后端全都失联，此时BGP控制面的行为依赖于Service的`externalTrafficPolicy`。如果是`Cluster`，根据`CiliumBGPPeeringPolicy`或`CiliumBGPClusterConfig`的配置，Service的虚拟IP会继续向外广播。如果`Local`，那么直接停掉广播，因为只有存在活着的后端，对应节点的虚拟IP才会向外广播。
+
+#### 解决办法
+
+BGP没啥办法。这是Kubernetes的事儿，可以试试PodDisruptionBudget。
